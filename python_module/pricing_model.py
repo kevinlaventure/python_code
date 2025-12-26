@@ -84,7 +84,7 @@ def compute_numeric_derivative(pricing_fun, base_params, param_names, h=None):
     raise ValueError("param_names must be a string or a tuple/list of two strings")
 
 class BSMModel:
-  
+
     @staticmethod
     def compute_option_with_forward(
         F: float, K: float, T: float, r: float, sigma: float,
@@ -151,6 +151,61 @@ class BSMModel:
             "volga": volga
         }
 
+    @staticmethod
+    def compute_option(
+        F: float, K: float, T: float, r: float, sigma: float,
+        option_type: str, compute_greeks: bool = False,
+        slide_list: Optional[List[float]] = None,
+        slide_compute: str = 'option_pnl',
+    ) -> Union[float, Dict[str, Any]]:
+        """
+        Computes the Black-76 price and (optionally) Greeks for a European option on forwards.
+
+        Args:
+            F: Forward price
+            K: Strike price
+            T: Time to maturity (in years)
+            r: Risk-free rate
+            sigma: Volatility
+            option_type: 'call' or 'put'
+            compute_greeks: If True, returns price and Greeks
+            slide_list: List of forward bumps (optional)
+            slide_type: 'spot_vol' or 'spot_only'
+            slide_compute: PnL calculation type ('delta_hedged_pnl', 'option_pnl', 'delta_pnl')
+
+        Returns:
+            Option price or dict with price, Greeks, and slide results
+        """
+        def _as_dict(res: Union[float, Dict[str, Any]]) -> Dict[str, Any]:
+            return res if isinstance(res, dict) else {"price": res}
+
+        slide_list = slide_list or []
+        base_result = _as_dict(
+            BSMModel.compute_option_with_forward(F, K, T, r, sigma, option_type, compute_greeks)
+        )
+
+        for slide in slide_list:
+            F_bumped = F * (1 + slide)
+            bumped_result = _as_dict(
+                BSMModel.compute_option_with_forward(
+                    F_bumped, K, T, r, sigma, option_type, compute_greeks)
+                )
+            if slide_compute == 'delta_hedged_pnl':
+                option_pnl = bumped_result['price'] - base_result['price']
+                delta_value = base_result.get('delta', np.nan)
+                delta_hedge_pnl = F * delta_value * slide * -1
+                total_pnl = delta_hedge_pnl + option_pnl
+                base_result[slide] = total_pnl
+            elif slide_compute == 'option_pnl':
+                base_result[slide] = bumped_result['price'] - base_result['price']
+            elif slide_compute == 'delta_pnl':
+                delta_value = base_result.get('delta', np.nan)
+                base_result[slide] = F * delta_value * slide * -1
+            else:
+                base_result[slide] = bumped_result.get(slide_compute, np.nan)
+
+        return base_result
+  
     @staticmethod
     def compute_forward(
         S: float, T: float, r: float, g: float, q: float
@@ -333,6 +388,16 @@ class BSMModel:
             'volga_pnl': volga_pnl,
             'unexplained_pnl': unexplained_pnl
         }
+    
+    @staticmethod
+    def solve_delta_strike(
+        F: float, T: float, sigma: float,r: float, option_type: str, target_delta: float) -> float:
+        def objective(K):
+            result = BSMModel.compute_option_with_forward(F, K[0], T, r, sigma, option_type, compute_greeks=True)
+            return (result['delta'] - target_delta) ** 2
+
+        res = minimize(objective, x0=[F], bounds=[(F * 0.01, F * 20.0)], method='L-BFGS-B')
+        return res.x[0]
 
 class MultiAssetBSMModel:
 
