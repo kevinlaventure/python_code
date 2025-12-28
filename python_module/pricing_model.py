@@ -155,7 +155,7 @@ class BSMModel:
     def compute_option(
         F: float, K: float, T: float, r: float, sigma: float,
         option_type: str, compute_greeks: bool = False,
-        slide_list: Optional[List[float]] = None,
+        slide_scenario: Optional[List[float]] = None,
         slide_compute: str = 'option_pnl',
     ) -> Union[float, Dict[str, Any]]:
         """
@@ -169,7 +169,7 @@ class BSMModel:
             sigma: Volatility
             option_type: 'call' or 'put'
             compute_greeks: If True, returns price and Greeks
-            slide_list: List of forward bumps (optional)
+            slide_scenario: List of forward bumps (optional)
             slide_type: 'spot_vol' or 'spot_only'
             slide_compute: PnL calculation type ('delta_hedged_pnl', 'option_pnl', 'delta_pnl')
 
@@ -179,12 +179,12 @@ class BSMModel:
         def _as_dict(res: Union[float, Dict[str, Any]]) -> Dict[str, Any]:
             return res if isinstance(res, dict) else {"price": res}
 
-        slide_list = slide_list or []
+        slide_scenario = slide_scenario if type(slide_scenario) is list else [slide_scenario]
         base_result = _as_dict(
             BSMModel.compute_option_with_forward(F, K, T, r, sigma, option_type, compute_greeks)
         )
 
-        for slide in slide_list:
+        for slide in slide_scenario:
             F_bumped = F * (1 + slide)
             bumped_result = _as_dict(
                 BSMModel.compute_option_with_forward(
@@ -513,7 +513,7 @@ class SABRModel:
     @staticmethod
     def compute_option(
         F: float, K: float, T: float, alpha: float, beta: float, rho: float, nu: float,
-        r: float, option_type: str, slide_list: Optional[List[float]] = None,
+        r: float, option_type: str, slide_scenario: Optional[List[float]] = None,
         slide_type: str = 'spot_vol', slide_compute: str = 'delta_hedged_pnl',
         compute_bs_greeks: bool = True, compute_model_greek: bool = False
     ) -> Dict[str, Any]:
@@ -523,7 +523,7 @@ class SABRModel:
         Args:
             F, K, T, alpha, beta, rho, nu, r: SABR and market parameters
             option_type: 'call' or 'put'
-            slide_list: List of spot bumps (optional)
+            slide_scenario: List of spot bumps (optional)
             slide_type: 'spot_vol' or 'spot_only'
             slide_compute: PnL calculation type
             compute_bs_greeks: if True, return BS-76 Greeks
@@ -535,7 +535,7 @@ class SABRModel:
         def _as_dict(res: Union[float, Dict[str, Any]]) -> Dict[str, Any]:
             return res if isinstance(res, dict) else {"price": res}
 
-        slide_list = slide_list or []
+        slide_scenario = slide_scenario = slide_scenario if type(slide_scenario) is list else [slide_scenario]
         iv = SABRModel.compute_sigma(F, K, T, alpha, beta, rho, nu)
         base_result = _as_dict(
             BSMModel.compute_option_with_forward(F, K, T, r, iv, option_type, compute_bs_greeks)
@@ -566,7 +566,7 @@ class SABRModel:
                 "sabr_theta": compute_numeric_derivative(price_scalar, base_params, "T"),
             })
 
-        for slide in slide_list:
+        for slide in slide_scenario:
             if slide_type == 'spot_vol':
                 F_bumped = F * (1 + slide)
                 dsigma = (nu / alpha) * rho * slide
