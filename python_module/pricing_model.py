@@ -185,6 +185,7 @@ class BSMModel:
         )
 
         for slide in slide_scenario:
+            if slide is None: continue
             F_bumped = F * (1 + slide)
             bumped_result = _as_dict(
                 BSMModel.compute_option_with_forward(
@@ -535,7 +536,7 @@ class SABRModel:
         def _as_dict(res: Union[float, Dict[str, Any]]) -> Dict[str, Any]:
             return res if isinstance(res, dict) else {"price": res}
 
-        slide_scenario = slide_scenario = slide_scenario if type(slide_scenario) is list else [slide_scenario]
+        slide_scenario = slide_scenario if type(slide_scenario) is list else [slide_scenario]
         iv = SABRModel.compute_sigma(F, K, T, alpha, beta, rho, nu)
         base_result = _as_dict(
             BSMModel.compute_option_with_forward(F, K, T, r, iv, option_type, compute_bs_greeks)
@@ -567,6 +568,7 @@ class SABRModel:
             })
 
         for slide in slide_scenario:
+            if slide is None: continue
             if slide_type == 'spot_vol':
                 F_bumped = F * (1 + slide)
                 dsigma = (nu / alpha) * rho * slide
