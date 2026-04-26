@@ -187,9 +187,10 @@ class BSMModel:
         for slide in slide_scenario:
             if slide is None: continue
             F_bumped = F * (1 + slide)
+            T_bumped = T - 1/252
             bumped_result = _as_dict(
                 BSMModel.compute_option_with_forward(
-                    F_bumped, K, T, r, sigma, option_type, compute_greeks)
+                    F_bumped, K, T_bumped, r, sigma, option_type, compute_greeks)
                 )
             if slide_compute == 'delta_hedged_pnl':
                 option_pnl = bumped_result['price'] - base_result['price']
@@ -569,22 +570,23 @@ class SABRModel:
 
         for slide in slide_scenario:
             if slide is None: continue
+            T_bumped = T - 1/252
             if slide_type == 'spot_vol':
                 F_bumped = F * (1 + slide)
                 dsigma = (nu / alpha) * rho * slide
                 alpha_bumped = alpha * (1 + dsigma)
-                iv_bumped = SABRModel.compute_sigma(F_bumped, K, T, alpha_bumped, beta, rho, nu)
+                iv_bumped = SABRModel.compute_sigma(F_bumped, K, T_bumped, alpha_bumped, beta, rho, nu)
                 bumped_result = _as_dict(
                     BSMModel.compute_option_with_forward(
-                        F_bumped, K, T, r, iv_bumped, option_type, compute_bs_greeks
+                        F_bumped, K, T_bumped, r, iv_bumped, option_type, compute_bs_greeks
                     )
                 )
             elif slide_type == 'spot_only':
                 F_bumped = F * (1 + slide)
-                iv_bumped = SABRModel.compute_sigma(F, K, T, alpha, beta, rho, nu)
+                iv_bumped = SABRModel.compute_sigma(F_bumped, K, T_bumped, alpha, beta, rho, nu)
                 bumped_result = _as_dict(
                     BSMModel.compute_option_with_forward(
-                        F_bumped, K, T, r, iv_bumped, option_type, compute_bs_greeks
+                        F_bumped, K, T_bumped, r, iv_bumped, option_type, compute_bs_greeks
                     )
                 )
             else:
@@ -827,3 +829,267 @@ class HestonHullWhiteModel:
             )
         
         return S, v, r
+
+class HestonModel:
+    """
+    Heston Stochastic Volatility Model for option pricing.
+    Uses Monte Carlo simulation for robust numerical pricing.
+    """
+
+    @staticmethod
+    def compute_option_with_spot(
+        S: float, K: float, T: float, r: float, v0: float,
+        kappa: float, theta: float, sigma: float, rho: float,
+        option_type: str, compute_greeks: bool = False,
+        n_paths: int = 10000, n_steps: int = 252
+    ) -> Union[float, Dict[str, Any]]:
+        """
+        Computes Heston option price using Monte Carlo simulation.
+        
+        Args:
+            S: Spot price
+            K: Strike price
+            T: Time to maturity (in years)
+            r: Risk-free rate
+            v0: Initial variance (volatility squared)
+            kappa: Mean reversion speed
+            theta: Long-term variance level
+            sigma: Volatility of volatility (vol of vol)
+            rho: Correlation between asset and variance
+            option_type: 'call' or 'put'
+            compute_greeks: If True, returns price and Greeks
+            n_paths: Number of Monte Carlo paths
+            n_steps: Number of time steps
+        
+        Returns:
+            Option price or dict with price and Greeks
+        """
+        if T == 0:
+            price = max(S - K, 0) if option_type == "call" else max(K - S, 0)
+            if not compute_greeks:
+                return price
+            return {
+                "price": price, "delta": np.nan, "gamma": np.nan,
+                "vega": np.nan, "theta": np.nan, "vanna": np.nan, "volga": np.nan
+            }
+        
+        # Run Monte Carlo simulation
+        S_paths, v_paths = HestonModel.compute_montecarlo(
+            S, T, r, v0, kappa, theta, sigma, rho,
+            n_steps, n_paths, seed=True
+        )
+        
+        # Get terminal prices (last row of paths)
+        S_terminal = S_paths.iloc[-1, :].values
+        
+        # Compute option payoff at maturity
+        if option_type == "call":
+            payoff = np.maximum(S_terminal - K, 0)
+        elif option_type == "put":
+            payoff = np.maximum(K - S_terminal, 0)
+        else:
+            raise ValueError("Invalid option type. Choose 'call' or 'put'.")
+        
+        # Discount and average
+        discount = np.exp(-r * T)
+        price = discount * np.mean(payoff)
+        
+        if not compute_greeks:
+            return price
+        
+        # Compute Greeks using numerical differentiation
+        base_params = {
+            "S": S, "K": K, "T": T, "r": r, "v0": v0,
+            "kappa": kappa, "theta": theta, "sigma": sigma, "rho": rho
+        }
+        
+        def price_scalar(**params):
+            return HestonModel.compute_option_with_spot(
+                params["S"], params["K"], params["T"], params["r"], params["v0"],
+                params["kappa"], params["theta"], params["sigma"], params["rho"],
+                option_type, compute_greeks=False, n_paths=5000, n_steps=100
+            )
+        
+        delta = compute_numeric_derivative(price_scalar, base_params, "S")
+        gamma = compute_numeric_derivative(price_scalar, base_params, ("S", "S"))
+        vega = compute_numeric_derivative(price_scalar, base_params, "v0") / 100
+        theta = compute_numeric_derivative(price_scalar, base_params, "T") / 252
+        vanna = compute_numeric_derivative(price_scalar, base_params, ("S", "v0")) / 100
+        volga = compute_numeric_derivative(price_scalar, base_params, ("v0", "v0")) / 10000
+        
+        return {
+            "price": price,
+            "delta": delta,
+            "gamma": gamma,
+            "vega": vega,
+            "theta": theta,
+            "vanna": vanna,
+            "volga": volga
+        }
+
+    @staticmethod
+    def compute_option(
+        S: float, K: float, T: float, r: float, v0: float,
+        kappa: float, theta: float, sigma: float, rho: float,
+        option_type: str, compute_greeks: bool = False,
+        slide_scenario: Optional[List[float]] = None,
+        slide_compute: str = 'option_pnl',
+        n_paths: int = 10000, n_steps: int = 252
+    ) -> Union[float, Dict[str, Any]]:
+        """
+        Computes Heston option price and (optionally) Greeks with scenario analysis.
+        
+        Args:
+            S: Spot price
+            K: Strike price
+            T: Time to maturity (in years)
+            r: Risk-free rate
+            v0: Initial variance
+            kappa: Mean reversion speed
+            theta: Long-term variance level
+            sigma: Volatility of volatility
+            rho: Correlation between asset and variance
+            option_type: 'call' or 'put'
+            compute_greeks: If True, returns price and Greeks
+            slide_scenario: List of spot bumps (optional)
+            slide_compute: PnL calculation type ('delta_hedged_pnl', 'option_pnl', 'delta_pnl')
+            n_paths: Number of Monte Carlo paths
+            n_steps: Number of time steps
+        
+        Returns:
+            Option price or dict with price, Greeks, and slide results
+        """
+        def _as_dict(res: Union[float, Dict[str, Any]]) -> Dict[str, Any]:
+            return res if isinstance(res, dict) else {"price": res}
+        
+        slide_scenario = slide_scenario if type(slide_scenario) is list else [slide_scenario]
+        base_result = _as_dict(
+            HestonModel.compute_option_with_spot(
+                S, K, T, r, v0, kappa, theta, sigma, rho, option_type,
+                compute_greeks, n_paths, n_steps
+            )
+        )
+        
+        for slide in slide_scenario:
+            if slide is None:
+                continue
+            S_bumped = S * (1 + slide)
+            T_bumped = T - 1/252
+            bumped_result = _as_dict(
+                HestonModel.compute_option_with_spot(
+                    S_bumped, K, T_bumped, r, v0, kappa, theta, sigma, rho, option_type,
+                    compute_greeks, n_paths, n_steps
+                )
+            )
+            
+            if slide_compute == 'delta_hedged_pnl':
+                option_pnl = bumped_result['price'] - base_result['price']
+                delta_value = base_result.get('delta', np.nan)
+                delta_hedge_pnl = S * delta_value * slide * -1
+                total_pnl = delta_hedge_pnl + option_pnl
+                base_result[slide] = total_pnl
+            elif slide_compute == 'option_pnl':
+                base_result[slide] = bumped_result['price'] - base_result['price']
+            elif slide_compute == 'delta_pnl':
+                delta_value = base_result.get('delta', np.nan)
+                base_result[slide] = S * delta_value * slide * -1
+            else:
+                base_result[slide] = bumped_result.get(slide_compute, np.nan)
+        
+        return base_result
+
+    @staticmethod
+    def solve_delta_strike(
+        S: float, T: float, r: float, v0: float,
+        kappa: float, theta: float, sigma: float, rho: float,
+        option_type: str, target_delta: float,
+        n_paths: int = 5000, n_steps: int = 100
+    ) -> float:
+        """
+        Finds the strike corresponding to a target delta.
+        
+        Args:
+            S, T, r, v0, kappa, theta, sigma, rho: Heston model parameters
+            option_type: 'call' or 'put'
+            target_delta: Desired delta
+            n_paths: Number of Monte Carlo paths for optimization
+            n_steps: Number of time steps for optimization
+        
+        Returns:
+            Strike value
+        """
+        def objective(K):
+            result = HestonModel.compute_option(
+                S, K[0], T, r, v0, kappa, theta, sigma, rho, option_type,
+                compute_greeks=True, n_paths=n_paths, n_steps=n_steps
+            )
+            return (result['delta'] - target_delta) ** 2
+        
+        res = minimize(objective, x0=[S], bounds=[(S * 0.01, S * 20.0)], method='L-BFGS-B')
+        return res.x[0]
+
+    @staticmethod
+    def compute_montecarlo(
+        S: float, T: float, r: float, v0: float,
+        kappa: float, theta: float, sigma: float, rho: float,
+        n_steps: int, n_paths: int, seed: bool = True, seed_value: Optional[int] = 44
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Simulates Heston paths using Euler-Maruyama scheme.
+        
+        Args:
+            S: Spot price
+            T: Time to maturity (in years)
+            r: Risk-free rate
+            v0: Initial variance
+            kappa: Mean reversion speed
+            theta: Long-term variance level
+            sigma: Volatility of volatility
+            rho: Correlation between asset and variance
+            n_steps: Number of time steps
+            n_paths: Number of simulation paths
+            seed: If True, sets random seed for reproducibility
+        
+        Returns:
+            Tuple of DataFrames: (S_paths, v_paths)
+        """
+        dt = T / n_steps
+        if seed:
+            rng = np.random.default_rng(seed_value)
+        else:
+            rng = np.random.default_rng()
+        
+        sqrt_dt = np.sqrt(dt)
+        
+        # Generate correlated Brownian motions
+        dW = np.zeros((n_paths, n_steps, 2))
+        Z1 = rng.standard_normal((n_paths, n_steps))
+        Z2 = rng.standard_normal((n_paths, n_steps))
+        
+        dW[:, :, 0] = Z1 * sqrt_dt
+        dW[:, :, 1] = (rho * Z1 + np.sqrt(1 - rho ** 2) * Z2) * sqrt_dt
+        
+        # Initialize arrays
+        S_paths = np.zeros((n_paths, n_steps + 1))
+        v_paths = np.zeros((n_paths, n_steps + 1))
+        S_paths[:, 0] = S
+        v_paths[:, 0] = v0
+        
+        for i in range(1, n_steps + 1):
+            v_prev = np.maximum(v_paths[:, i - 1], 0.0)
+            
+            # Heston variance SDE (full truncation)
+            v_paths[:, i] = (
+                v_paths[:, i - 1]
+                + kappa * (theta - v_prev) * dt
+                + sigma * np.sqrt(v_prev) * dW[:, i - 1, 1]
+            )
+            v_paths[:, i] = np.maximum(v_paths[:, i], 0.0)
+            
+            # Asset SDE
+            S_paths[:, i] = (
+                S_paths[:, i - 1]
+                * np.exp((r - 0.5 * v_prev) * dt + np.sqrt(v_prev) * dW[:, i - 1, 0])
+            )
+        
+        return pd.DataFrame(S_paths).transpose(), pd.DataFrame(v_paths).transpose()
