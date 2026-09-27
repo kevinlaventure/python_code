@@ -1,5 +1,5 @@
 import warnings
-from typing import Dict, List, NamedTuple, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence, Union
 
 import cvxpy as cp
 import numpy as np
@@ -7,6 +7,9 @@ import pandas as pd
 from scipy.optimize import nnls
 
 from .pricing_model import BSMModel
+
+
+Floors = Union[List[str], Dict[str, float]]
 
 
 class ReductionResult(NamedTuple):
@@ -17,7 +20,7 @@ class ReductionResult(NamedTuple):
 
 def constrained_lasso(
     X: pd.DataFrame, y: pd.Series, risk: Optional[pd.DataFrame], max_positions: int,
-    floors: Optional[List[str]] = None, bands: Optional[Dict[str, float]] = None,
+    floors: Optional[Floors] = None, bands: Optional[Dict[str, float]] = None,
     eps_scale: float = 0.5, n_iter: int = 10, n_grid: int = 30, n_refine: int = 15,
 ) -> ReductionResult:
     """
@@ -33,13 +36,13 @@ def constrained_lasso(
         risk: (n_pos, n_metrics) risk of each position, indexed like X.columns. Full book risk = risk.sum().
               None for an unconstrained fit.
         max_positions: maximum number of positions kept.
-        floors: metrics constrained to reduced - full >= 0.
+        floors: metrics constrained to reduced >= full, as a list, or {metric: ratio} for reduced >= ratio * full.
         bands: {metric: tol} constraining |reduced - full| <= tol * |full|.
 
     Returns:
         ReductionResult(weights, r2, risk_check)
     """
-    floors, bands = floors or [], bands or {}
+    floors, bands = _floor_ratios(floors), bands or {}
     risk = pd.DataFrame(index=X.columns) if risk is None else risk
     n, p = X.shape
     R, z, r2 = _scaled_qr(X, y)
@@ -77,7 +80,7 @@ def constrained_lasso(
 
 def omp(
     X: pd.DataFrame, y: pd.Series, risk: Optional[pd.DataFrame], max_positions: int,
-    floors: Optional[List[str]] = None, bands: Optional[Dict[str, float]] = None, n_candidates: int = 20,
+    floors: Optional[Floors] = None, bands: Optional[Dict[str, float]] = None, n_candidates: int = 20,
 ) -> ReductionResult:
     """
     Orthogonal Matching Pursuit (long-only, no penalty) under the same risk constraints as constrained_lasso.
@@ -91,7 +94,7 @@ def omp(
     If no feasible selection is found, the long-only fit is returned and risk_check shows the breach.
     Same inputs and output as constrained_lasso.
     """
-    floors, bands = floors or [], bands or {}
+    floors, bands = _floor_ratios(floors), bands or {}
     risk = pd.DataFrame(index=X.columns) if risk is None else risk
     p = X.shape[1]
     R, z, r2 = _scaled_qr(X, y)
@@ -148,11 +151,17 @@ def _scaled_qr(X: pd.DataFrame, y: pd.Series):
     return R, z, lambda coef: 1 - (np.sum((z - R @ coef) ** 2) + sse_perp) / sst
 
 
-def _risk_constraints(w, columns, risk: pd.DataFrame, floors: List[str], bands: Dict[str, float]) -> list:
+def _floor_ratios(floors: Optional[Floors]) -> Dict[str, float]:
+    """Floors as {metric: ratio}: a list means ratio 1 (reduced >= full)."""
+    return dict(floors) if isinstance(floors, dict) else dict.fromkeys(floors or [], 1.0)
+
+
+def _risk_constraints(w, columns, risk: pd.DataFrame, floors: Dict[str, float], bands: Dict[str, float]) -> list:
     """Risk constraints on (reduced - full) / |full| for the weights w of the positions `columns`."""
     full = risk.sum()
     rel = {m: risk.loc[columns, m].to_numpy() / abs(full[m]) @ w - np.sign(full[m]) for m in [*floors, *bands]}
-    return [rel[m] >= 0 for m in floors] + [cp.abs(rel[m]) <= tol for m, tol in bands.items()]
+    return ([rel[m] + (1 - ratio) * np.sign(full[m]) >= 0 for m, ratio in floors.items()]      # reduced >= ratio * full
+            + [cp.abs(rel[m]) <= tol for m, tol in bands.items()])
 
 
 def _solve(problem: cp.Problem, w: cp.Variable) -> Optional[np.ndarray]:
@@ -170,13 +179,13 @@ def _solve(problem: cp.Problem, w: cp.Variable) -> Optional[np.ndarray]:
     return coef
 
 
-def _risk_check(weights: pd.Series, risk: pd.DataFrame, floors: List[str], bands: Dict[str, float]) -> pd.DataFrame:
+def _risk_check(weights: pd.Series, risk: pd.DataFrame, floors: Dict[str, float], bands: Dict[str, float]) -> pd.DataFrame:
     """full / reduced / diff per risk metric, and ok = whether each constraint holds (NaN if unconstrained)."""
     full = risk.sum()
     reduced = risk.loc[weights.index].mul(weights, axis=0).sum()
     risk_check = pd.DataFrame({"full": full, "reduced": reduced, "diff": reduced - full})
     tol = 1e-5 * full.abs()                                                   # solver precision
-    risk_check["ok"] = pd.Series({m: risk_check.loc[m, "diff"] >= -tol[m] for m in floors}
+    risk_check["ok"] = pd.Series({m: risk_check.loc[m, "reduced"] - ratio * full[m] >= -tol[m] for m, ratio in floors.items()}
                                  | {m: abs(risk_check.loc[m, "diff"]) <= b * abs(full[m]) + tol[m] for m, b in bands.items()},
                                  dtype=object)
     return risk_check
@@ -249,6 +258,8 @@ def quick_terminal_payoff_omp(
     risk_floor: List[str],
     risk_tolerance: Dict[str, float],
     max_position: int = 10,
+    option_bid_offer: Optional[pd.Series] = None,
+    pnl_haircut: Optional[float] = None,
 ) -> ReductionResult:
     """
     Reduces a portfolio of options to at most max_position options whose terminal payoff tracks the portfolio's,
@@ -262,16 +273,51 @@ def quick_terminal_payoff_omp(
         risk_floor: risks constrained to sum(reduced weight x risk) - sum(portfolio weight x risk) >= 0.
         risk_tolerance: {risk: tol} constraining |reduced - portfolio| <= tol * |portfolio| (e.g. {"vega": 0.05}).
         max_position: maximum number of options kept.
+        option_bid_offer: optional bid-offer P&L per unit of each option, indexed by option name, negative for a loss.
+                          The full portfolio P&L loss is pnl_loss = sum(portfolio_weight * option_bid_offer).
+        pnl_haircut: with option_bid_offer, constrains sum(reduced weight * option_bid_offer) >= pnl_haircut * pnl_loss,
+                     e.g. 0.8: the reduced portfolio loses at most 80% of the full one. Shown as the "bid_offer" row of
+                     risk_check.
 
     Returns:
         ReductionResult(weights, r2, risk_check): weights = reduced quantity per kept option (same units as
         portfolio_weight), r2 = fit of the reduced to the portfolio terminal payoff, risk_check = portfolio / reduced /
         diff / ok per risk.
     """
+    return _quick_terminal_payoff(omp, portfolio_weight, option_terminal_payoff, risk_t0, risk_floor, risk_tolerance,
+                                  max_position, option_bid_offer, pnl_haircut)
+
+
+def quick_terminal_payoff_lasso(
+    portfolio_weight: pd.Series,
+    option_terminal_payoff: pd.DataFrame,
+    risk_t0: pd.DataFrame,
+    risk_floor: List[str],
+    risk_tolerance: Dict[str, float],
+    max_position: int = 10,
+    option_bid_offer: Optional[pd.Series] = None,
+    pnl_haircut: Optional[float] = None,
+) -> ReductionResult:
+    """Same as quick_terminal_payoff_omp with the constrained lasso (see constrained_lasso) instead of OMP."""
+    return _quick_terminal_payoff(constrained_lasso, portfolio_weight, option_terminal_payoff, risk_t0, risk_floor,
+                                  risk_tolerance, max_position, option_bid_offer, pnl_haircut)
+
+
+def _quick_terminal_payoff(solver, portfolio_weight, option_terminal_payoff, risk_t0, risk_floor, risk_tolerance,
+                           max_position, option_bid_offer=None, pnl_haircut=None) -> ReductionResult:
+    """Adds the optional bid-offer floor, scales the unit payoffs and risks by the portfolio weights, runs the solver
+    against the portfolio's own terminal payoff and converts the multipliers back to quantities."""
+    if (option_bid_offer is None) != (pnl_haircut is None):
+        raise ValueError("option_bid_offer and pnl_haircut must be given together")
+    floors = dict.fromkeys(risk_floor, 1.0)
+    if option_bid_offer is not None:
+        risk_t0 = risk_t0.assign(bid_offer=option_bid_offer.reindex(risk_t0.index))
+        floors["bid_offer"] = pnl_haircut
+
     names = portfolio_weight.index
     X = option_terminal_payoff[names].mul(portfolio_weight, axis=1)          # payoff of each position
     risk = risk_t0.loc[names].mul(portfolio_weight, axis=0)                   # risk of each position
-    result = omp(X, X.sum(axis=1), risk, max_position, risk_floor, risk_tolerance)
+    result = solver(X, X.sum(axis=1), risk, max_position, floors, risk_tolerance)
     reduced_weight = result.weights * portfolio_weight[result.weights.index]
     risk_check = result.risk_check.rename(columns={"full": "portfolio"})
     return ReductionResult(reduced_weight, result.r2, risk_check)
