@@ -21,7 +21,7 @@ class ReductionResult(NamedTuple):
 def constrained_lasso(
     X: pd.DataFrame, y: pd.Series, risk: Optional[pd.DataFrame], max_positions: int,
     floors: Optional[Floors] = None, bands: Optional[Dict[str, float]] = None,
-    eps_scale: float = 0.5, n_iter: int = 10, n_grid: int = 30, n_refine: int = 15,
+    eps_scale: float = 0.5, n_iter: int = 10, n_grid: int = 30, n_refine: int = 15, alpha_max: float = 1.0,
 ) -> ReductionResult:
     """
     Selects at most max_positions positions whose weighted sum tracks y, under risk constraints vs the full book.
@@ -29,6 +29,8 @@ def constrained_lasso(
     Iteratively reweighted long-only lasso (Candes, Wakin & Boyd 2008), no least squares refit: each strike's penalty
     is 1 / (w_j + eps) from the previous fit, eps = eps_scale * mean active weight, and the lasso alpha is the best
     fit with at most max_positions positions on a log grid (refined around the best point).
+    n_iter = 1 is the standard lasso (single pass, same penalty on every strike). The risk constraints then keep more
+    than max_positions strikes active at the top of the default grid, so start it higher with alpha_max (e.g. 100).
 
     Args:
         X: (n_obs, n_pos) contribution of each position (e.g. hedged P&L per path). The full book is weights = 1.
@@ -38,6 +40,7 @@ def constrained_lasso(
         max_positions: maximum number of positions kept.
         floors: metrics constrained to reduced >= full, as a list, or {metric: ratio} for reduced >= ratio * full.
         bands: {metric: tol} constraining |reduced - full| <= tol * |full|.
+        alpha_max: start of the alpha grid, as a multiple of the alpha where the first strike enters.
 
     Returns:
         ReductionResult(weights, r2, risk_check)
@@ -59,7 +62,7 @@ def constrained_lasso(
 
     def best_alpha(strike_penalty):
         top = (R.T @ z / n / strike_penalty).max()                            # alpha where the first strike enters
-        grid = [f for a in np.geomspace(top, top * 1e-4, n_grid) if (f := fit(a, strike_penalty))]
+        grid = [f for a in np.geomspace(top * alpha_max, top * 1e-4, n_grid) if (f := fit(a, strike_penalty))]
         best = max([f for f in grid if f["n"] <= max_positions] or [min(grid, key=lambda f: f["n"])], key=lambda f: f["r2"])
         smaller = [f["alpha"] for f in grid if f["alpha"] < best["alpha"]]
         if smaller:
@@ -239,7 +242,7 @@ def terminal_payoff_lasso(
         t0_risk: t0 risk of each option position, indexed by option strike, one column per metric.
         risk_floor: metrics constrained to reduced - full >= 0 (e.g. gamma_cash, theta, slides).
         risk_tolerance: {metric: tol} constraining |reduced - full| <= tol * |full| (e.g. {"vega": 0.05}).
-        lasso_kwargs: eps_scale, n_iter, n_grid, n_refine passed to constrained_lasso.
+        lasso_kwargs: eps_scale, n_iter, n_grid, n_refine, alpha_max passed to constrained_lasso.
 
     Returns:
         ReductionResult(weights, r2, risk_check), weights indexed by strike as multipliers of the option positions.
